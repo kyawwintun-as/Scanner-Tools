@@ -1,150 +1,163 @@
 #!/usr/bin/env python3
-
+"""AS-scanner"""
 
 from __future__ import annotations
 
 import argparse
-import getpass
-import os
-import shutil
-import subprocess
+import concurrent.futures
+import socket
 import sys
-import tempfile
-from dataclasses import dataclass
+from typing import Iterable
 
 
 def print_banner() -> None:
-	red = "\033[1;91m"
-	yellow = "\033[1;93m"
+	red = "\033[91m"
 	reset = "\033[0m"
 	banner = r"""
-============================================
-                ASPIRATION
-   ___  ____        ____  __  __ ____  ____
-  / _ |/ __/_______/ __/ / / / // __ \/ __/
- / __ / _// __/___/\ \  / /_/ // /_/ /\ \
-/_/ |_/___/_/      /___/  \____/ \____/___/
-                 Mr-Loser
-                ==========
+  
+ ==================ASPIRATION====================
+   ___  ____        ____
+  / _ |/ __/_______/ __/______ ____  ___ ____
+ / __ / _// __/___/\ \/ __/ _ `/ _ \/ -_) __/
+/_/ |_/___/_/      /___/\__/\_,_/ .__/\__/_/
+                               /_/
+                     Mr-Loser
+                 ----------------                       
 """
-	print(f"{red}{banner}{yellow}          FIREWALL SHARE CHECK{reset}\n")
+	print(f"{red}{banner}{reset}")
 
 
-@dataclass
-class Credentials:
-	username: str
-	password: str | None = None
-	domain: str | None = None
-	no_password: bool = False
+def parse_ports(value: str) -> list[int]:
+	"""Parse ports like ``22,80,443,8000-8010`` or ``-`` for all ports."""
+	if value.strip() == "-":
+		return list(range(1, 65536))
 
+	ports: set[int] = set()
 
-def choose_mode() -> str:
-	print("Authentication mode:")
-	print("  1) Anonymous")
-	print("  2) Guest")
-	print("  3) Authenticated")
-	while True:
-		choice = input("Select [1-3]: ").strip()
-		if choice in {"1", "2", "3"}:
-			return {"1": "anonymous", "2": "guest", "3": "authenticated"}[choice]
-		print("Please choose 1, 2, or 3.")
-
-
-def prompt_credentials(mode: str) -> Credentials:
-	if mode == "anonymous":
-		return Credentials(username="", no_password=True)
-	if mode == "guest":
-		return Credentials(username="guest", no_password=True)
-
-	username = input("Username: ").strip()
-	if not username:
-		raise ValueError("username cannot be empty")
-	domain = input("Domain/workgroup (optional): ").strip() or None
-	password = getpass.getpass("Password: ")
-	return Credentials(username=username, password=password, domain=domain)
-
-
-def authentication_file(credentials: Credentials) -> tempfile.NamedTemporaryFile:
-	file = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False)
-	os.chmod(file.name, 0o600)
-	file.write(f"username = {credentials.username}\n")
-	file.write(f"password = {credentials.password or ''}\n")
-	if credentials.domain:
-		file.write(f"domain = {credentials.domain}\n")
-	file.close()
-	return file
-
-
-def run_smbclient(host: str, credentials: Credentials, share: str | None = None) -> int:
-	auth_file = authentication_file(credentials)
-	try:
-		if share:
-			service = f"//{host}/{share}"
-			command = ["smbclient", service, "-A", auth_file.name]
+	for item in value.split(","):
+		item = item.strip()
+		if not item:
+			continue
+		if "-" in item:
+			start_text, end_text = item.split("-", 1)
+			try:
+				start, end = int(start_text), int(end_text)
+			except ValueError as error:
+				raise argparse.ArgumentTypeError(
+					f"invalid port range: {item}"
+				) from error
+			if start > end:
+				start, end = end, start
+			ports.update(range(start, end + 1))
 		else:
-			command = ["smbclient", "-L", host, "-A", auth_file.name]
-		return subprocess.run(command).returncode
-	finally:
-		os.unlink(auth_file.name)
+			try:
+				ports.add(int(item))
+			except ValueError as error:
+				raise argparse.ArgumentTypeError(f"invalid port: {item}") from error
+
+	invalid = sorted(port for port in ports if not 1 <= port <= 65535)
+	if invalid:
+		raise argparse.ArgumentTypeError(
+			f"ports must be between 1 and 65535: {invalid[0]}"
+		)
+	if not ports:
+		raise argparse.ArgumentTypeError("at least one port is required")
+	return sorted(ports)
+
+
+def scan_port(address: tuple, port: int, timeout: float) -> tuple[int, bool]:
+	"""Return whether a TCP connection can be established to a port."""
+	try:
+		connection_address = (address[0], port)
+		with socket.create_connection(connection_address, timeout=timeout):
+			return port, True
+	except (ConnectionRefusedError, socket.timeout, TimeoutError, OSError):
+		return port, False
+
+
+def scan(
+	address: tuple,
+	ports: Iterable[int],
+	timeout: float,
+	workers: int,
+) -> list[int]:
+	"""Scan ports concurrently and return open ports in ascending order."""
+	with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+		checks = [executor.submit(scan_port, address, port, timeout) for port in ports]
+		open_ports = []
+		completed = 0
+		total = len(checks)
+		for check in concurrent.futures.as_completed(checks):
+			port, is_open = check.result()
+			if is_open:
+				open_ports.append(port)
+			completed += 1
+			if total >= 1000 and (completed % 1000 == 0 or completed == total):
+				print(f"\rProgress: {completed}/{total} ports checked", end="", flush=True)
+		if total >= 1000:
+			print()
+	return sorted(open_ports)
 
 
 def build_parser() -> argparse.ArgumentParser:
-	parser = argparse.ArgumentParser(
-		description="List and optionally connect to SMB shares on an authorized host."
-	)
-	parser.add_argument("host", nargs="?", help="SMB hostname or IP address")
+	parser = argparse.ArgumentParser(description="Scan TCP ports on a host.")
+	parser.add_argument("host", help="hostname or IP address to scan")
 	parser.add_argument(
-		"-m",
-		"--mode",
-		choices=("anonymous", "guest", "authenticated"),
-		help="authentication mode; omit it to choose interactively",
+		"-p",
+		"--ports",
+		default="1-1024",
+		help="ports to scan, e.g. 22,80,443, 1-1024, or - for all ports (default: 1-1024)",
+	)
+	parser.add_argument(
+		"-t",
+		"--timeout",
+		type=float,
+		default=0.5,
+		help="connection timeout in seconds (default: 0.5)",
+	)
+	parser.add_argument(
+		"-w",
+		"--workers",
+		type=int,
+		default=100,
+		help="maximum simultaneous connections (default: 100)",
 	)
 	return parser
 
 
 def main() -> int:
-	if shutil.which("smbclient") is None:
-		print("Error: smbclient is not installed or not in PATH.", file=sys.stderr)
-		return 1
+	parser = build_parser()
+	args = parser.parse_args()
 
+	if args.timeout <= 0:
+		parser.error("--timeout must be greater than zero")
+	if args.workers <= 0:
+		parser.error("--workers must be greater than zero")
+	try:
+		ports = parse_ports(args.ports)
+		addresses = socket.getaddrinfo(args.host, None, type=socket.SOCK_STREAM)
+	except (argparse.ArgumentTypeError, socket.gaierror) as error:
+		parser.error(str(error))
+
+	address = addresses[0][4]
 	print_banner()
-	args = build_parser().parse_args()
-	host = args.host or input("SMB host/IP: ").strip()
-	if not host:
-		print("Error: host cannot be empty.", file=sys.stderr)
-		return 2
-
-	mode = args.mode or choose_mode()
+	print(f"Scanning {args.host} ({len(ports)} TCP ports)...")
 	try:
-		credentials = prompt_credentials(mode)
-	except (EOFError, KeyboardInterrupt):
-		print("\nCancelled.", file=sys.stderr)
+		open_ports = scan(address, ports, args.timeout, args.workers)
+	except KeyboardInterrupt:
+		print("\nScan interrupted.", file=sys.stderr)
 		return 130
-	except ValueError as error:
-		print(f"Error: {error}", file=sys.stderr)
-		return 2
 
-	print(f"\nListing SMB shares on {host}...")
-	try:
-		result = run_smbclient(host, credentials)
-	except (OSError, KeyboardInterrupt) as error:
-		print(f"SMB check failed: {error}", file=sys.stderr)
-		return 1
-	if result != 0:
-		print("Could not list shares. Check the host and selected credentials.", file=sys.stderr)
-		return result
-
-	try:
-		connect = input("\nConnect to a share? Enter its name, or press Enter to exit: ").strip()
-	except (EOFError, KeyboardInterrupt):
-		print()
-		return 0
-	if connect:
-		if "/" in connect or "\\" in connect or connect in {".", ".."}:
-			print("Invalid share name.", file=sys.stderr)
-			return 2
-		print(f"Opening //{host}/{connect}. Type 'help' for SMB commands.")
-		return run_smbclient(host, credentials, connect)
+	if open_ports:
+		print("Open ports:")
+		for port in open_ports:
+			try:
+				service = socket.getservbyport(port, "tcp")
+			except OSError:
+				service = "unknown"
+			print(f"  {port}/tcp ({service})")
+	else:
+		print("No open TCP ports found.")
 	return 0
 
 
